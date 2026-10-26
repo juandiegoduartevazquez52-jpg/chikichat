@@ -1,0 +1,18 @@
+[
+  {
+    "username": "DangerDuck",
+    "password": "Spartor3",
+    "age": "18 años",
+    "gender": "Hombre",
+    "fcmToken": "e0ZLRvCdSF20YnDkgXJ5eI:APA91bGwW1g3YPaOmmVw_4veQqc5QzVMA6hwT1rcJh8YxYur-iJhO3G11gEJxaJW1G_Jg5Tsl6OyMOhNZaXI460s0M21Uq4XClbga5rZ_-1hoZc8LtMmJlw",
+    "avatarUrl": "/uploads/avatars/1792888792873-753966670.jpg"
+  },
+  {
+    "username": "TuHermanoNovio",
+    "password": "Varios",
+    "age": "19 años",
+    "gender": "Hombre",
+    "fcmToken": "ede9V6Z4QYSBcwoDRaZXe8:APA91bFb3uBsLehy8JW7Udjn7ZoOHvt5ZW6tHXwAz_1OiV1jBqp2K5YyNSsIQu_mSX8j3nJibMZ3lXTzCPiHK978yZar8YuJtOCm0AiFv4yI7HD5sM0C_Kk",
+    "avatarUrl": "/uploads/avatars/1792732108048-27134090.jpg"
+  }
+]
