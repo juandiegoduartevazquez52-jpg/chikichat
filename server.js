@@ -711,11 +711,10 @@ const server = http.createServer((req, res) => {
         });
     } else {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Servidor ChikiChat activo');
+        res.end('Ruta no encontrada');
     }
 });
 
-const PORT = 3000;
-server.listen(PORT, () => {
-    console.log(`Servidor de ChikiChat corriendo en http://localhost:${PORT}`);
+server.listen(3000, '0.0.0.0', () => {
+    console.log('Servidor ChikiChat corriendo en el puerto 3000');
 });
