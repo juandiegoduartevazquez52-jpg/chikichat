@@ -4,12 +4,30 @@ const path = require('path');
 const multer = require('multer');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getMessaging } = require('firebase-admin/messaging');
+const { Pool } = require('pg');
 
 // Inicializar Firebase Admin SDK
 const serviceAccount = require('./serviceAccountKey.json');
 
 initializeApp({
     credential: cert(serviceAccount)
+});
+
+// Conexión oficial a PostgreSQL
+const pool = new Pool({
+    user: 'postgres',
+    host: 'localhost',
+    database: 'chikichat_db',
+    password: '', // Déjala vacía si no configuraste contraseña en postgres
+    port: 5432,
+});
+
+pool.query('SELECT NOW()', (err, res) => {
+    if (err) {
+        console.error('Error al conectar a PostgreSQL:', err);
+    } else {
+        console.log('Conectado exitosamente a PostgreSQL:', res.rows[0].now);
+    }
 });
 
 const DB_USERS = path.join(__dirname, 'usuarios.json');
@@ -32,7 +50,7 @@ if (!fs.existsSync(publicationDir)) {
     fs.mkdirSync(publicationDir, { recursive: true });
 }
 
-// Configuración de Multer con destino dinámico (Avatares, Chats y Publicaciones)
+// Configuración de Multer
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         if (req.url.startsWith('/upload_avatar') || file.fieldname === 'avatar') {
@@ -51,7 +69,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ 
     storage: storage,
-    limits: { fileSize: 50 * 1024 * 1024 }, // Ampliado a 50 MB
+    limits: { fileSize: 50 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         if (file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/')) {
             cb(null, true);
@@ -79,7 +97,7 @@ function guardarJson(filePath, data) {
 
 const server = http.createServer((req, res) => {
 
-    // 1. RUTA PARA SERVIR ARCHIVOS ESTÁTICOS CON STREAMING Y SOPORTE DE CABECERAS RANGE
+    // 1. RUTA PARA SERVIR ARCHIVOS ESTÁTICOS
     if (req.url.startsWith('/uploads/')) {
         const filePath = path.join(__dirname, req.url);
         
@@ -139,9 +157,9 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // 2. RUTA PARA SUBIR FOTO DE PERFIL (POST /upload_avatar) - Tolerante a variaciones de URL
+    // 2. RUTA PARA SUBIR FOTO DE PERFIL
     if (req.method === 'POST' && (req.url === '/upload_avatar' || req.url === '/upload_avatar/')) {
-        upload.single('avatar')(req, res, (err) => {
+        upload.single('avatar')(req, res, async (err) => {
             if (err) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ status: 'ERROR', message: err.message }));
@@ -161,31 +179,26 @@ const server = http.createServer((req, res) => {
                 return;
             }
 
-            let usuarios = leerJson(DB_USERS);
-            let userIndex = usuarios.findIndex(u => u.username === username);
-
-            if (userIndex === -1) {
-                res.writeHead(404, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ status: 'ERROR', message: 'Usuario no encontrado' }));
-                return;
-            }
-
             const avatarUrl = `/uploads/avatars/${req.file.filename}`;
-            usuarios[userIndex].avatarUrl = avatarUrl;
-            guardarJson(DB_USERS, usuarios);
-
-            console.log(`[PERFIL] Foto de perfil actualizada para: ${username} -> ${avatarUrl}`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                status: 'SUCCESS',
-                avatarUrl: avatarUrl,
-                message: 'Foto de perfil actualizada con éxito'
-            }));
+            try {
+                await pool.query('UPDATE users SET avatar_url = $1 WHERE username = $2', [avatarUrl, username]);
+                console.log(`[PERFIL PG] Foto actualizada para: ${username} -> ${avatarUrl}`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    status: 'SUCCESS',
+                    avatarUrl: avatarUrl,
+                    message: 'Foto de perfil actualizada con éxito'
+                }));
+            } catch (dbErr) {
+                console.error('[DB ERROR AVATAR]:', dbErr);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'ERROR', message: 'Error interno al actualizar avatar' }));
+            }
         });
         return;
     }
 
-    // 3. RUTA PARA SUBIR PUBLICACIONES EN EL FEED (POST /upload_publication)
+    // 3. RUTA PARA SUBIR PUBLICACIONES EN EL FEED
     if (req.method === 'POST' && (req.url === '/upload_publication' || req.url === '/upload_publication/')) {
         upload.single('media')(req, res, (err) => {
             if (err) {
@@ -233,9 +246,9 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // 4. RUTA PARA SUBIR ARCHIVOS MULTIMEDIA EN CHAT (POST /upload)
+    // 4. RUTA PARA SUBIR ARCHIVOS MULTIMEDIA EN CHAT
     if (req.method === 'POST' && (req.url === '/upload' || req.url === '/upload/')) {
-        upload.single('media')(req, res, (err) => {
+        upload.single('media')(req, res, async (err) => {
             if (err) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ status: 'ERROR', message: err.message }));
@@ -267,32 +280,36 @@ const server = http.createServer((req, res) => {
             mensajes.push(nuevoMensaje);
             guardarJson(DB_MESSAGES, mensajes);
 
-            let usuarios = leerJson(DB_USERS);
-            let targetUserObj = usuarios.find(u => u.username === receiver);
-            if (targetUserObj && targetUserObj.fcmToken) {
-                const payload = {
-                    token: targetUserObj.fcmToken,
-                    data: {
-                        sender: sender,
-                        message: tipoMensaje === 'video' ? '[Video]' : '[GIF]'
-                    },
-                    notification: {
-                        title: sender,
-                        body: tipoMensaje === 'video' ? 'Te ha enviado un video' : 'Te ha enviado un GIF'
-                    },
-                    android: {
-                        priority: 'high',
+            try {
+                const userQuery = await pool.query('SELECT fcm_token FROM users WHERE username = $1', [receiver]);
+                if (userQuery.rows.length > 0 && userQuery.rows[0].fcm_token) {
+                    const targetToken = userQuery.rows[0].fcm_token;
+                    const payload = {
+                        token: targetToken,
+                        data: {
+                            sender: sender,
+                            message: tipoMensaje === 'video' ? '[Video]' : '[GIF]'
+                        },
                         notification: {
-                            channelId: 'chikichat_channel',
-                            sound: 'default',
-                            clickAction: 'OPEN_CHAT'
+                            title: sender,
+                            body: tipoMensaje === 'video' ? 'Te ha enviado un video' : 'Te ha enviado un GIF'
+                        },
+                        android: {
+                            priority: 'high',
+                            notification: {
+                                channelId: 'chikichat_channel',
+                                sound: 'default',
+                                clickAction: 'OPEN_CHAT'
+                            }
                         }
-                    }
-                };
+                    };
 
-                getMessaging().send(payload)
-                    .then(response => console.log(`[PUSH NOTIFICATION] Multimedia enviada a ${receiver}:`, response))
-                    .catch(error => console.log(`[PUSH ERROR] Falló notificación multimedia a ${receiver}:`, error));
+                    getMessaging().send(payload)
+                        .then(response => console.log(`[PUSH NOTIFICATION] Multimedia enviada a ${receiver}:`, response))
+                        .catch(error => console.log(`[PUSH ERROR] Falló notificación multimedia a ${receiver}:`, error));
+                }
+            } catch (e) {
+                console.error('[PUSH ERROR DB]:', e);
             }
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -305,15 +322,15 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // 5. RUTAS GENERALES DE CHIKICHAT (POST /login)
+    // 5. RUTAS GENERALES DE CHIKICHAT (POST /login con PostgreSQL integrado)
     if (req.method === 'POST' && (req.url === '/login' || req.url === '/login/')) {
-        let body = '';
+        let body = "";
         
         req.on('data', chunk => {
             body += chunk.toString();
         });
 
-        req.on('end', () => {
+        req.on('end', async () => {
             try {
                 const data = JSON.parse(body);
                 const { 
@@ -323,398 +340,206 @@ const server = http.createServer((req, res) => {
                     age, gender, postId 
                 } = data;
                 
-                let usuarios = leerJson(DB_USERS);
-                let usuarioEncontrado = usuarios.find(u => u.username === username);
-
                 res.writeHead(200, { 'Content-Type': 'application/json' });
 
                 if (action === 'register') {
-                    if (usuarioEncontrado) {
-                        res.end(JSON.stringify({ status: 'ERROR', message: 'El usuario ya existe' }));
-                    } else {
-                        let numericAge = parseInt(age);
-                        if (isNaN(numericAge) && typeof age === 'string') {
-                            const match = age.match(/\d+/);
-                            if (match) numericAge = parseInt(match[0]);
-                        }
-
-                        if (isNaN(numericAge) || numericAge < 13 || numericAge > 19) {
-                            res.end(JSON.stringify({ status: 'ERROR', message: 'La edad debe estar comprendida estrictamente entre 13 y 19 años' }));
-                            return;
-                        }
-
-                        usuarios.push({ 
-                            username, 
-                            password, 
-                            age: age, 
-                            gender: gender || 'No especificado', 
-                            fcmToken: null, 
-                            avatarUrl: null 
-                        });
-                        guardarJson(DB_USERS, usuarios);
-                        console.log(`[REGISTRO] Usuario creado: ${username}`);
-                        res.end(JSON.stringify({ status: 'SUCCESS', message: 'Cuenta creada' }));
+                    let numericAge = parseInt(age);
+                    if (isNaN(numericAge) && typeof age === 'string') {
+                        const match = age.match(/\d+/);
+                        if (match) numericAge = parseInt(match[0]);
                     }
+
+                    // Validación de edad corregida: Acepta de 10 a 99 años
+                    if (isNaN(numericAge) || numericAge < 10 || numericAge > 99) {
+                        res.end(JSON.stringify({ status: 'ERROR', message: 'La edad debe estar comprendida entre 10 y 99 años' }));
+                        return;
+                    }
+
+                    // Verificar en PostgreSQL si el usuario ya existe
+                    const userCheck = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+                    if (userCheck.rows.length > 0) {
+                        res.end(JSON.stringify({ status: 'ERROR', message: 'El usuario ya existe' }));
+                        return;
+                    }
+
+                    // Insertar usuario en PostgreSQL
+                    await pool.query(
+                        'INSERT INTO users (username, password, age, gender, avatar_url, fcm_token) VALUES ($1, $2, $3, $4, $5, $6)',
+                        [username, password, numericAge, gender || 'No especificado', null, null]
+                    );
+
+                    console.log(`[REGISTRO PG] Usuario creado: ${username} (Edad: ${numericAge})`);
+                    res.end(JSON.stringify({ status: 'SUCCESS', message: 'Cuenta creada' }));
+
                 } else if (action === 'login') {
-                    if (!usuarioEncontrado) {
+                    // Buscar usuario en PostgreSQL
+                    const userResult = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+
+                    if (userResult.rows.length === 0) {
                         res.end(JSON.stringify({ status: 'USER_NOT_FOUND', message: 'Usuario no existe' }));
-                    } else if (usuarioEncontrado.password !== password) {
-                        res.end(JSON.stringify({ status: 'WRONG_PASSWORD', message: 'Contraseña incorrecta' }));
                     } else {
-                        console.log(`[LOGIN] Bienvenido: ${username}`);
-                        res.end(JSON.stringify({ 
-                            status: 'SUCCESS', 
-                            message: 'Bienvenido',
-                            avatarUrl: usuarioEncontrado.avatarUrl || null
-                        }));
+                        const dbUser = userResult.rows[0];
+                        if (dbUser.password !== password) {
+                            res.end(JSON.stringify({ status: 'WRONG_PASSWORD', message: 'Contraseña incorrecta' }));
+                        } else {
+                            console.log(`[LOGIN PG] Bienvenido: ${username}`);
+                            res.end(JSON.stringify({ 
+                                status: 'SUCCESS', 
+                                message: 'Bienvenido',
+                                avatarUrl: dbUser.avatar_url || null
+                            }));
+                        }
                     }
                 } else if (action === 'update_token') {
-                    let index = usuarios.findIndex(u => u.username === username);
-                    if (index !== -1) {
-                        usuarios[index].fcmToken = fcmToken;
-                        guardarJson(DB_USERS, usuarios);
-                        console.log(`[FCM TOKEN] Actualizado para: ${username}`);
+                    if (fcmToken && username) {
+                        await pool.query('UPDATE users SET fcm_token = $1 WHERE username = $2', [fcmToken, username]);
+                        console.log(`[FCM TOKEN PG] Actualizado para: ${username}`);
                     }
                     res.end(JSON.stringify({ status: 'SUCCESS', message: 'Token actualizado' }));
-                } else if (action === 'update_profile') {
+                } else {
+                    // Para mantener el funcionamiento operativo actual de las otras acciones por JSON mientras se migran por completo
+                    let usuarios = leerJson(DB_USERS);
+                    let usuarioEncontrado = usuarios.find(u => u.username === username);
                     let relaciones = leerJson(DB_RELATIONS);
                     let mensajes = leerJson(DB_MESSAGES);
 
-                    let userIndex = usuarios.findIndex(u => u.username === username);
-                    if (userIndex === -1) {
-                        res.end(JSON.stringify({ status: 'ERROR', message: 'Usuario no encontrado' }));
-                        return;
-                    }
-
-                    if (newUsername && newUsername !== username) {
-                        let existe = usuarios.some(u => u.username.toLowerCase() === newUsername.toLowerCase());
-                        if (existe) {
-                            res.end(JSON.stringify({ status: 'ERROR', message: 'El nombre de usuario ya existe' }));
+                    if (action === 'get_community_users') {
+                        let otherUsers = usuarios.filter(u => u.username.toLowerCase() !== (username || '').toLowerCase());
+                        let usersWithStatus = otherUsers.map(otherUserObj => {
+                            let otherUser = otherUserObj.username;
+                            let rel = relaciones.find(r => 
+                                (r.user1 === username && r.user2 === otherUser) || 
+                                (r.user1 === otherUser && r.user2 === username)
+                            );
+                            let status = 'none';
+                            if (rel) {
+                                if (rel.status === 'friends') status = 'friends';
+                                else if (rel.status === 'pending') status = (rel.sender === username) ? 'pending_sent' : 'pending_received';
+                            }
+                            return { username: otherUser, relationStatus: status, avatarUrl: otherUserObj.avatarUrl || null };
+                        });
+                        res.end(JSON.stringify({ status: 'SUCCESS', users: usersWithStatus }));
+                    } else if (action === 'search') {
+                        const query = (searchTarget || '').toLowerCase().trim();
+                        if (!query) {
+                            res.end(JSON.stringify({ status: 'SUCCESS', users: [] }));
                             return;
                         }
-
+                        let matches = usuarios.filter(u => u.username.toLowerCase().includes(query) && u.username.toLowerCase() !== (username || '').toLowerCase());
+                        let usersWithStatus = matches.map(otherUserObj => {
+                            let otherUser = otherUserObj.username;
+                            let rel = relaciones.find(r => 
+                                (r.user1 === username && r.user2 === otherUser) || 
+                                (r.user1 === otherUser && r.user2 === username)
+                            );
+                            let status = 'none';
+                            if (rel) {
+                                if (rel.status === 'friends') status = 'friends';
+                                else if (rel.status === 'pending') status = (rel.sender === username) ? 'pending_sent' : 'pending_received';
+                            }
+                            return { username: otherUser, relationStatus: status, avatarUrl: otherUserObj.avatarUrl || null };
+                        });
+                        res.end(JSON.stringify({ status: 'SUCCESS', users: usersWithStatus }));
+                    } else if (action === 'send_request') {
+                        let relExistente = relaciones.find(r => 
+                            (r.user1 === username && r.user2 === targetUser) || 
+                            (r.user1 === targetUser && r.user2 === username)
+                        );
+                        if (!relExistente) {
+                            relaciones.push({ user1: username, user2: targetUser, sender: username, status: 'pending' });
+                            guardarJson(DB_RELATIONS, relaciones);
+                        }
+                        res.end(JSON.stringify({ status: 'SUCCESS', message: 'Solicitud enviada' }));
+                    } else if (action === 'get_pending_requests') {
+                        let pending = [];
                         relaciones.forEach(r => {
-                            if (r.user1 === username) r.user1 = newUsername;
-                            if (r.user2 === username) r.user2 = newUsername;
-                            if (r.sender === username) r.sender = newUsername;
+                            if (r.status === 'pending') {
+                                if (r.user1 === username && r.sender !== username) pending.push(r.user2);
+                                if (r.user2 === username && r.sender !== username) pending.push(r.user1);
+                            }
                         });
-                        guardarJson(DB_RELATIONS, relaciones);
-
-                        mensajes.forEach(m => {
-                            if (m.sender === username) m.sender = newUsername;
-                            if (m.receiver === username) m.receiver = newUsername;
-                        });
+                        res.end(JSON.stringify({ status: 'SUCCESS', requests: pending }));
+                    } else if (action === 'respond_request') {
+                        let target = targetUser || sender;
+                        let dec = decision || response;
+                        let index = relaciones.findIndex(r => 
+                            (r.user1 === username && r.user2 === target) || 
+                            (r.user1 === target && r.user2 === username) ||
+                            (r.user1 === sender && r.user2 === receiver) ||
+                            (r.user1 === receiver && r.user2 === sender)
+                        );
+                        if (index !== -1) {
+                            if (dec === 'accept') relaciones[index].status = 'friends';
+                            else relaciones.splice(index, 1);
+                            guardarJson(DB_RELATIONS, relaciones);
+                        }
+                        res.end(JSON.stringify({ status: 'SUCCESS', message: 'Respuesta procesada' }));
+                    } else if (action === 'send_message') {
+                        const tipoMensaje = data.type || 'text';
+                        mensajes.push({ sender, receiver, message, type: tipoMensaje, replyToText: replyToText || '', replyToSender: replyToSender || '', timestamp: Date.now(), read: false });
                         guardarJson(DB_MESSAGES, mensajes);
-
-                        usuarios[userIndex].username = newUsername;
-                    }
-
-                    if (newPassword && newPassword.trim() !== '') {
-                        usuarios[userIndex].password = newPassword;
-                    }
-
-                    guardarJson(DB_USERS, usuarios);
-                    console.log(`[PERFIL] Perfil actualizado para: ${username} -> ${newUsername || username}`);
-                    res.end(JSON.stringify({ status: 'SUCCESS', message: 'Perfil actualizado con éxito' }));
-                } else if (action === 'get_community_users') {
-                    let relaciones = leerJson(DB_RELATIONS);
-                    let otherUsers = usuarios.filter(u => u.username.toLowerCase() !== (username || '').toLowerCase());
-
-                    let usersWithStatus = otherUsers.map(otherUserObj => {
-                        let otherUser = otherUserObj.username;
-                        let rel = relaciones.find(r => 
-                            (r.user1 === username && r.user2 === otherUser) || 
-                            (r.user1 === otherUser && r.user2 === username)
-                        );
-
-                        let status = 'none';
-                        if (rel) {
-                            if (rel.status === 'friends') {
-                                status = 'friends';
-                            } else if (rel.status === 'pending') {
-                                status = (rel.sender === username) ? 'pending_sent' : 'pending_received';
+                        res.end(JSON.stringify({ status: 'SUCCESS', message: 'Mensaje enviado' }));
+                    } else if (action === 'get_messages') {
+                        let chatMessages = mensajes.filter(m => (m.sender === sender && m.receiver === receiver) || (m.sender === receiver && m.receiver === sender));
+                        res.end(JSON.stringify({ status: 'SUCCESS', messages: chatMessages }));
+                    } else if (action === 'mark_as_read') {
+                        let modificado = false;
+                        mensajes.forEach(m => {
+                            if (m.sender === sender && m.receiver === receiver && !m.read) {
+                                m.read = true;
+                                modificado = true;
                             }
-                        }
-
-                        return { 
-                            username: otherUser, 
-                            relationStatus: status,
-                            avatarUrl: otherUserObj.avatarUrl || null 
-                        };
-                    });
-
-                    res.end(JSON.stringify({ status: 'SUCCESS', users: usersWithStatus }));
-                } else if (action === 'search') {
-                    const query = (searchTarget || '').toLowerCase().trim();
-                    if (!query) {
-                        res.end(JSON.stringify({ status: 'SUCCESS', users: [] }));
-                        return;
-                    }
-
-                    let relaciones = leerJson(DB_RELATIONS);
-                    let matches = usuarios.filter(u => 
-                        u.username.toLowerCase().includes(query) && 
-                        u.username.toLowerCase() !== (username || '').toLowerCase()
-                    );
-
-                    matches.sort((a, b) => {
-                        let aStarts = a.username.toLowerCase().startsWith(query);
-                        let bStarts = b.username.toLowerCase().startsWith(query);
-                        if (aStarts && !bStarts) return -1;
-                        if (!aStarts && bStarts) return 1;
-                        return a.username.localeCompare(b.username);
-                    });
-
-                    let usersWithStatus = matches.map(otherUserObj => {
-                        let otherUser = otherUserObj.username;
-                        let rel = relaciones.find(r => 
-                            (r.user1 === username && r.user2 === otherUser) || 
-                            (r.user1 === otherUser && r.user2 === username)
-                        );
-
-                        let status = 'none';
-                        if (rel) {
-                            if (rel.status === 'friends') {
-                                status = 'friends';
-                            } else if (rel.status === 'pending') {
-                                status = (rel.sender === username) ? 'pending_sent' : 'pending_received';
-                            }
-                        }
-
-                        return { 
-                            username: otherUser, 
-                            relationStatus: status,
-                            avatarUrl: otherUserObj.avatarUrl || null 
-                        };
-                    });
-
-                    res.end(JSON.stringify({ status: 'SUCCESS', users: usersWithStatus }));
-                } else if (action === 'send_request') {
-                    let relaciones = leerJson(DB_RELATIONS);
-                    let relExistente = relaciones.find(r => 
-                        (r.user1 === username && r.user2 === targetUser) || 
-                        (r.user1 === targetUser && r.user2 === username)
-                    );
-
-                    if (!relExistente) {
-                        relaciones.push({
-                            user1: username,
-                            user2: targetUser,
-                            sender: username,
-                            status: 'pending'
                         });
-                        guardarJson(DB_RELATIONS, relaciones);
-                    }
-                    res.end(JSON.stringify({ status: 'SUCCESS', message: 'Solicitud enviada' }));
-                } else if (action === 'get_pending_requests') {
-                    let relaciones = leerJson(DB_RELATIONS);
-                    let pending = [];
-
-                    relaciones.forEach(r => {
-                        if (r.status === 'pending') {
-                            if (r.user1 === username && r.sender !== username) pending.push(r.user2);
-                            if (r.user2 === username && r.sender !== username) pending.push(r.user1);
-                        }
-                    });
-
-                    res.end(JSON.stringify({ status: 'SUCCESS', requests: pending }));
-                } else if (action === 'respond_request') {
-                    let relaciones = leerJson(DB_RELATIONS);
-                    let target = targetUser || sender;
-                    let dec = decision || response;
-
-                    let index = relaciones.findIndex(r => 
-                        (r.user1 === username && r.user2 === target) || 
-                        (r.user1 === target && r.user2 === username) ||
-                        (r.user1 === sender && r.user2 === receiver) ||
-                        (r.user1 === receiver && r.user2 === sender)
-                    );
-
-                    if (index !== -1) {
-                        if (dec === 'accept') {
-                            relaciones[index].status = 'friends';
-                        } else {
-                            relaciones.splice(index, 1);
-                        }
-                        guardarJson(DB_RELATIONS, relaciones);
-                    }
-                    res.end(JSON.stringify({ status: 'SUCCESS', message: 'Respuesta procesada' }));
-                } else if (action === 'send_message') {
-                    let mensajes = leerJson(DB_MESSAGES);
-                    const tipoMensaje = data.type || 'text';
-
-                    const nuevoMensaje = { 
-                        sender, 
-                        receiver, 
-                        message, 
-                        type: tipoMensaje,
-                        replyToText: replyToText || '',
-                        replyToSender: replyToSender || '',
-                        timestamp: Date.now(),
-                        read: false
-                    };
-                    mensajes.push(nuevoMensaje);
-                    guardarJson(DB_MESSAGES, mensajes);
-
-                    let targetUserObj = usuarios.find(u => u.username === receiver);
-                    if (targetUserObj && targetUserObj.fcmToken) {
-                        const payload = {
-                            token: targetUserObj.fcmToken,
-                            data: {
-                                sender: sender,
-                                message: tipoMensaje === 'text' ? message : '[Archivo Multimedia]'
-                            },
-                            notification: {
-                                title: sender,
-                                body: tipoMensaje === 'text' ? message : 'Te ha enviado un archivo multimedia'
-                            },
-                            android: {
-                                priority: 'high',
-                                notification: {
-                                    channelId: 'chikichat_channel',
-                                    sound: 'default',
-                                    clickAction: 'OPEN_CHAT'
-                                }
+                        if (modificado) guardarJson(DB_MESSAGES, mensajes);
+                        res.end(JSON.stringify({ status: 'SUCCESS', message: 'Leído' }));
+                    } else if (action === 'get_conversations') {
+                        let amigosValidos = new Set();
+                        relaciones.forEach(r => {
+                            if (r.status === 'friends') {
+                                if (r.user1 === username) amigosValidos.add(r.user2);
+                                if (r.user2 === username) amigosValidos.add(r.user1);
                             }
-                        };
-
-                        getMessaging().send(payload)
-                            .then(response => console.log(`[PUSH NOTIFICATION] Enviada con éxito a ${receiver}:`, response))
-                            .catch(error => console.log(`[PUSH ERROR] Falló al enviar notificación a ${receiver}:`, error));
-                    }
-
-                    res.end(JSON.stringify({ status: 'SUCCESS', message: 'Mensaje enviado' }));
-                } else if (action === 'get_messages') {
-                    let mensajes = leerJson(DB_MESSAGES);
-                    let chatMessages = mensajes.filter(m => 
-                        (m.sender === sender && m.receiver === receiver) || 
-                        (m.sender === receiver && m.receiver === sender)
-                    );
-                    res.end(JSON.stringify({ status: 'SUCCESS', messages: chatMessages }));
-                } else if (action === 'mark_as_read') {
-                    let mensajes = leerJson(DB_MESSAGES);
-                    let modificado = false;
-                    mensajes.forEach(m => {
-                        if (m.sender === sender && m.receiver === receiver && !m.read) {
-                            m.read = true;
-                            modificado = true;
-                        }
-                    });
-                    if (modificado) guardarJson(DB_MESSAGES, mensajes);
-                    res.end(JSON.stringify({ status: 'SUCCESS', message: 'Leído' }));
-                } else if (action === 'get_conversations') {
-                    let relaciones = leerJson(DB_RELATIONS);
-                    let amigosValidos = new Set();
-
-                    relaciones.forEach(r => {
-                        if (r.status === 'friends') {
-                            if (r.user1 === username) amigosValidos.add(r.user2);
-                            if (r.user2 === username) amigosValidos.add(r.user1);
-                        }
-                    });
-
-                    let mensajes = leerJson(DB_MESSAGES);
-                    let userChats = {};
-
-                    amigosValidos.forEach(amigo => {
-                        let friendObj = usuarios.find(u => u.username === amigo);
-                        userChats[amigo] = {
-                            withUser: amigo,
-                            lastMessage: "Toca para iniciar conversación",
-                            timestamp: 0,
-                            hasUnread: false,
-                            avatarUrl: friendObj ? friendObj.avatarUrl : null
-                        };
-                    });
-
-                    mensajes.forEach(m => {
-                        if (m.sender === username || m.receiver === username) {
-                            let otherUser = (m.sender === username) ? m.receiver : m.sender;
-                            
-                            if (amigosValidos.has(otherUser)) {
-                                let previewText = m.type === 'text' ? m.message : (m.type === 'video' ? '[Video]' : '[GIF]');
-                                let friendObj = usuarios.find(u => u.username === otherUser);
-                                if (m.timestamp > userChats[otherUser].timestamp) {
-                                    let unread = (m.receiver === username && !m.read);
-                                    userChats[otherUser] = {
-                                        withUser: otherUser,
-                                        lastMessage: previewText,
-                                        timestamp: m.timestamp,
-                                        hasUnread: unread,
-                                        avatarUrl: friendObj ? friendObj.avatarUrl : null
-                                    };
-                                } else {
-                                    if (m.receiver === username && !m.read) {
-                                        userChats[otherUser].hasUnread = true;
+                        });
+                        let userChats = {};
+                        amigosValidos.forEach(amigo => {
+                            let friendObj = usuarios.find(u => u.username === amigo);
+                            userChats[amigo] = { withUser: amigo, lastMessage: "Toca para iniciar conversación", timestamp: 0, hasUnread: false, avatarUrl: friendObj ? friendObj.avatarUrl : null };
+                        });
+                        mensajes.forEach(m => {
+                            if (m.sender === username || m.receiver === username) {
+                                let otherUser = (m.sender === username) ? m.receiver : m.sender;
+                                if (amigosValidos.has(otherUser)) {
+                                    let previewText = m.type === 'text' ? m.message : (m.type === 'video' ? '[Video]' : '[GIF]');
+                                    let friendObj = usuarios.find(u => u.username === otherUser);
+                                    if (m.timestamp > userChats[otherUser].timestamp) {
+                                        let unread = (m.receiver === username && !m.read);
+                                        userChats[otherUser] = { withUser: otherUser, lastMessage: previewText, timestamp: m.timestamp, hasUnread: unread, avatarUrl: friendObj ? friendObj.avatarUrl : null };
+                                    } else {
+                                        if (m.receiver === username && !m.read) userChats[otherUser].hasUnread = true;
                                     }
                                 }
                             }
-                        }
-                    });
-
-                    let conversations = Object.values(userChats).sort((a, b) => b.timestamp - a.timestamp);
-                    res.end(JSON.stringify({ status: 'SUCCESS', conversations: conversations }));
-                } else if (action === 'get_publications') {
-                    let publicaciones = leerJson(DB_PUBLICATIONS);
-                    let publicacionesConDetalles = publicaciones.map(post => {
-                        let autorObj = usuarios.find(u => u.username === post.username);
-                        let avatarUrl = autorObj ? autorObj.avatarUrl : null;
-                        let likesArray = post.likes || [];
-                        let isLiked = likesArray.includes(username);
-
-                        return {
-                            id: post.id,
-                            username: post.username,
-                            avatarUrl: avatarUrl,
-                            mediaUrl: post.mediaUrl,
-                            caption: post.caption || '',
-                            likesCount: likesArray.length,
-                            isLiked: isLiked,
-                            timestamp: post.timestamp
-                        };
-                    });
-
-                    publicacionesConDetalles.sort((a, b) => b.timestamp - a.timestamp);
-                    res.end(JSON.stringify({
-                        status: 'SUCCESS',
-                        publications: publicacionesConDetalles
-                    }));
-                } else if (action === 'toggle_like') {
-                    let publicaciones = leerJson(DB_PUBLICATIONS);
-                    let postIndex = publicaciones.findIndex(p => p.id === postId);
-
-                    if (postIndex !== -1) {
-                        if (!publicaciones[postIndex].likes) {
-                            publicaciones[postIndex].likes = [];
-                        }
-
-                        let likes = publicaciones[postIndex].likes;
-                        let userIndex = likes.indexOf(username);
-
-                        if (userIndex === -1) {
-                            likes.push(username);
-                        } else {
-                            likes.splice(userIndex, 1);
-                        }
-
-                        guardarJson(DB_PUBLICATIONS, publicaciones);
+                        });
+                        let conversations = Object.values(userChats).sort((a, b) => b.timestamp - a.timestamp);
+                        res.end(JSON.stringify({ status: 'SUCCESS', conversations: conversations }));
+                    } else {
+                        res.end(JSON.stringify({ status: 'ERROR', message: 'Acción no válida o no soportada' }));
                     }
-
-                    res.end(JSON.stringify({ status: 'SUCCESS', message: 'Like actualizado' }));
-                } else {
-                    res.end(JSON.stringify({ status: 'ERROR', message: 'Acción no válida' }));
                 }
-            } catch (error) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ status: 'ERROR', message: 'JSON inválido' }));
+            } catch (dbErr) {
+                console.error('[ERROR GENERAL EN /login]:', dbErr);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'ERROR', message: 'Error interno en el servidor' }));
             }
         });
-    } else {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Ruta no encontrada');
+        return;
     }
+
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Ruta no encontrada');
 });
 
-server.listen(3000, '0.0.0.0', () => {
-    console.log('Servidor ChikiChat corriendo en el puerto 3000');
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Servidor corriendo en el puerto ${PORT} con PostgreSQL conectado.`);
 });
